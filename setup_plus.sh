@@ -1,113 +1,94 @@
 #!/bin/bash
 
 # VPS VIP Management System Installer
-# Creates API endpoint that handles {"vip_users":[{"Name":"","id":"","month":"","Valid":"","start_date":"","Expiration":""}]} format
+# Version: 1.0
+# Author: PaingPainghein
+
+# Configuration
+APP_NAME="vipmanager"
+APP_PORT=8080
+VPS_IP="45.154.26.195"
+DB_NAME="vip_users"
+DB_USER="vipadmin"
+DB_PASS=$(openssl rand -hex 16)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
 # Update system
+echo -e "${YELLOW}[1/8] Updating system packages...${NC}"
 apt update -y && apt upgrade -y
 
 # Install dependencies
-apt install -y openjdk-17-jdk git maven nginx
+echo -e "${YELLOW}[2/8] Installing dependencies...${NC}"
+apt install -y openjdk-17-jdk git maven nginx mariadb-server
+
+# Setup MySQL/MariaDB
+echo -e "${YELLOW}[3/8] Configuring database...${NC}"
+mysql -e "CREATE DATABASE ${DB_NAME};"
+mysql -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+mysql -e "GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';"
+mysql -e "FLUSH PRIVILEGES;"
 
 # Create application directory
-mkdir -p /opt/vipmanager
-cd /opt/vipmanager
+echo -e "${YELLOW}[4/8] Creating application structure...${NC}"
+mkdir -p /opt/${APP_NAME}/{config,logs}
+cd /opt/${APP_NAME}
 
-# Create Spring Boot application
-cat > src/main/java/com/pphdev/vipmanager/VipManagerApplication.java <<'EOL'
-package com.pphdev.vipmanager;
+# Clone repository
+echo -e "${YELLOW}[5/8] Downloading application...${NC}"
+git clone https://github.com/PaingPainghein/pphdev_vip_script.git .
 
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.http.ResponseEntity;
-import java.util.concurrent.ConcurrentHashMap;
+# Build application
+echo -e "${YELLOW}[6/8] Building application...${NC}"
+mvn clean package
 
-@SpringBootApplication
-@RestController
-@RequestMapping("/api/v1")
-public class VipManagerApplication {
+# Configuration files
+echo -e "${YELLOW}[7/8] Creating configuration files...${NC}"
 
-    private ConcurrentHashMap<String, String> userData = new ConcurrentHashMap<>();
+# application.properties
+cat > /opt/${APP_NAME}/config/application.properties <<EOL
+server.port=${APP_PORT}
+spring.datasource.url=jdbc:mysql://localhost:3306/${DB_NAME}
+spring.datasource.username=${DB_USER}
+spring.datasource.password=${DB_PASS}
+spring.jpa.hibernate.ddl-auto=update
+vps.token.secret=$(openssl rand -hex 32)
+EOL
 
-    public static void main(String[] args) {
-        SpringApplication.run(VipManagerApplication.class, args);
+# nginx configuration
+cat > /etc/nginx/sites-available/${APP_NAME} <<EOL
+server {
+    listen 80;
+    server_name ${VPS_IP};
+
+    location / {
+        proxy_pass http://localhost:${APP_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
-
-    @GetMapping("/users")
-    public ResponseEntity<String> getUsers() {
-        String data = userData.getOrDefault("vip_data", "{\"vip_users\":[]}");
-        return ResponseEntity.ok(data);
-    }
-
-    @PostMapping("/users")
-    public ResponseEntity<String> updateUsers(@RequestBody String payload) {
-        userData.put("vip_data", payload);
-        return ResponseEntity.ok("{\"status\":\"success\"}");
-    }
+    
+    access_log /var/log/nginx/${APP_NAME}_access.log;
+    error_log /var/log/nginx/${APP_NAME}_error.log;
 }
 EOL
 
-# Create application properties
-mkdir -p src/main/resources
-cat > src/main/resources/application.properties <<EOL
-server.port=8080
-spring.jackson.serialization.indent_output=true
-EOL
-
-# Create pom.xml
-cat > pom.xml <<'EOL'
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>2.7.0</version>
-        <relativePath/>
-    </parent>
-    
-    <groupId>com.pphdev</groupId>
-    <artifactId>vipmanager</artifactId>
-    <version>1.0.0</version>
-    <name>vipmanager</name>
-    
-    <properties>
-        <java.version>17</java.version>
-    </properties>
-    
-    <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-EOL
-
-# Build the application
-mvn clean package
-
-# Create systemd service
-cat > /etc/systemd/system/vipmanager.service <<EOL
+# systemd service file
+cat > /etc/systemd/system/${APP_NAME}.service <<EOL
 [Unit]
 Description=VIP Manager Service
-After=syslog.target
+After=syslog.target network.target
 
 [Service]
 User=root
-WorkingDirectory=/opt/vipmanager
-ExecStart=/usr/bin/java -jar /opt/vipmanager/target/vipmanager-1.0.0.jar
+WorkingDirectory=/opt/${APP_NAME}
+ExecStart=/usr/bin/java -jar /opt/${APP_NAME}/target/${APP_NAME}-1.0.0.jar
+Environment="SPRING_CONFIG_LOCATION=file:/opt/${APP_NAME}/config/application.properties"
+
 SuccessExitStatus=143
 Restart=always
 RestartSec=30
@@ -116,33 +97,23 @@ RestartSec=30
 WantedBy=multi-user.target
 EOL
 
-# Configure Nginx
-cat > /etc/nginx/sites-available/vipmanager <<EOL
-server {
-    listen 80;
-    server_name 45.154.26.195;
-
-    location /api/ {
-        proxy_pass http://localhost:8080/api/;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    }
-}
-EOL
-
 # Enable services
-ln -s /etc/nginx/sites-available/vipmanager /etc/nginx/sites-enabled/
+echo -e "${YELLOW}[8/8] Enabling services...${NC}"
+ln -s /etc/nginx/sites-available/${APP_NAME} /etc/nginx/sites-enabled/
 systemctl daemon-reload
-systemctl enable vipmanager
-systemctl start vipmanager
+systemctl enable ${APP_NAME}
+systemctl start ${APP_NAME}
 systemctl restart nginx
 
-# Initialize with empty VIP data
-curl -X POST http://localhost:8080/api/v1/users \
-     -H "Content-Type: application/json" \
-     -d '{"vip_users":[]}'
+# Firewall configuration
+ufw allow 80/tcp
+ufw allow 22/tcp
+ufw --force enable
 
-echo "Installation complete!"
-echo "VIP Manager is running on: http://45.154.26.195/api/v1/users"
-echo "Initialized with empty VIP users array"
+echo -e "${GREEN}Installation completed successfully!${NC}"
+echo -e "\n${YELLOW}Important Information:${NC}"
+echo -e "Database Name: ${DB_NAME}"
+echo -e "Database User: ${DB_USER}"
+echo -e "Database Password: ${DB_PASS}"
+echo -e "API Endpoint: http://${VPS_IP}/api/v1/users"
+echo -e "Access Token: $(grep 'vps.token.secret' /opt/${APP_NAME}/config/application.properties | cut -d'=' -f2)"
